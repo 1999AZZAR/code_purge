@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+Universal dead-code analyzer for code-purge skill.
+
+Detects languages present, runs appropriate static-analysis tools,
+and outputs a structured JSON report to stdout.
+
+Usage:
+    python3 analyze.py [project_root] [--json|--summary]
+    python3 analyze.py . --json > report.json
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Optional
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class Finding:
+    category: str          # dead_code | duplicate | unused_import | unused_file | complexity
+    severity: str          # high | medium | low
+    file: str
+    line: Optional[int]
+    description: str
+    tool: str
+
+
+@dataclass
+class Report:
+    project_root: str
+    languages: list[str]
+    findings: list[Finding] = field(default_factory=list)
+    tool_errors: list[str] = field(default_factory=list)
+    summary: dict = field(default_factory=dict)
+
+    def add(self, finding: Finding) -> None:
+        self.findings.append(finding)
+
+    def add_error(self, msg: str) -> None:
+        self.tool_errors.append(msg)
+
+    def build_summary(self) -> None:
+        counts: dict[str, int] = {}
+        for f in self.findings:
+            counts[f.category] = counts.get(f.category, 0) + 1
+        self.summary = {
+            "total": len(self.findings),
+            "by_category": counts,
+            "by_severity": {
+                s: sum(1 for f in self.findings if f.severity == s)
+                for s in ("high", "medium", "low")
+            },
+        }
+
+
+# ── Language detection ────────────────────────────────────────────────────────
+
+EXT_MAP = {
+    ".py": "python",
+    ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
+    ".ts": "typescript", ".tsx": "typescript",
+    ".go": "go",
+    ".rb": "ruby",
+    ".java": "java",
+    ".rs": "rust",
+    ".php": "php",
+    ".cs": "csharp",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".c": "c", ".h": "c",
+}
+
+SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv",
+    "dist", "build", ".cache", ".next", ".nuxt", "coverage",
+    ".code-purge-backups",
+}
+
+
+def detect_languages(root: Path) -> list[str]:
+    counts: dict[str, int] = {}
+    for p in root.rglob("*"):
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        lang = EXT_MAP.get(p.suffix.lower())
+        if lang:
+            counts[lang] = counts.get(lang, 0) + 1
+    return sorted(counts, key=lambda k: -counts[k])
+
+
+# ── Tool runners ──────────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], cwd: str, timeout: int = 120) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return -1, "", f"tool not found: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return -2, "", f"timeout: {cmd[0]}"
+
+
+def _tool_available(name: str) -> bool:
+    return subprocess.run(["which", name], capture_output=True).returncode == 0
+
+
+def run_vulture(root: str, report: Report) -> None:
+    """Python dead code via vulture."""
+    if not _tool_available("vulture"):
+        report.add_error("vulture not installed (pip install vulture)")
+        return
+    _, out, _ = _run(["vulture", ".", "--min-confidence", "80"], root)
+    if not out:
+        return
+    for line in out.splitlines():
+        # format: path/file.py:12: unused function 'foo' (confidence: 90%)
+        m = re.match(r"^(.+):(\d+):\s+(.+)\s+\(confidence:\s*(\d+)%\)$", line)
+        if m:
+            fpath, lineno, desc, conf = m.groups()
+            severity = "high" if int(conf) >= 90 else "medium"
+            report.add(Finding(
+                category="dead_code",
+                severity=severity,
+                file=fpath,
+                line=int(lineno),
+                description=desc.strip(),
+                tool="vulture",
+            ))
+
+
+def run_pyflakes(root: str, report: Report) -> None:
+    """Python unused imports via pyflakes."""
+    if not _tool_available("pyflakes"):
+        report.add_error("pyflakes not installed (pip install pyflakes)")
+        return
+    _, out, err = _run(["pyflakes", "."], root)
+    combined = out + err
+    for line in combined.splitlines():
+        m = re.match(r"^(.+):(\d+):\d+\s+'(.+)' imported but unused$", line)
+        if m:
+            fpath, lineno, sym = m.groups()
+            report.add(Finding(
+                category="unused_import",
+                severity="low",
+                file=fpath,
+                line=int(lineno),
+                description=f"'{sym}' imported but unused",
+                tool="pyflakes",
+            ))
+        # redefined
+        m2 = re.match(r"^(.+):(\d+):\d+\s+redefinition of unused '(.+)'", line)
+        if m2:
+            fpath, lineno, sym = m2.groups()
+            report.add(Finding(
+                category="dead_code",
+                severity="medium",
+                file=fpath,
+                line=int(lineno),
+                description=f"redefinition of unused '{sym}'",
+                tool="pyflakes",
+            ))
+
+
+def run_knip(root: str, report: Report) -> None:
+    """JS/TS dead exports and unused files via knip."""
+    if not _tool_available("knip") and not _tool_available("npx"):
+        report.add_error("knip not available (npm i -g knip or use npx knip)")
+        return
+    cmd = ["knip", "--reporter", "json"] if _tool_available("knip") else ["npx", "--yes", "knip", "--reporter", "json"]
+    out = _run(cmd, root, timeout=180)[1]
+    if not out.strip():
+        return
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return
+
+    # Unused files
+    for f in data.get("files", []):
+        report.add(Finding(
+            category="unused_file",
+            severity="medium",
+            file=f,
+            line=None,
+            description="file has no imports from the rest of the project",
+            tool="knip",
+        ))
+    # Unused exports
+    for item in data.get("exports", []):
+        report.add(Finding(
+            category="dead_code",
+            severity="low",
+            file=item.get("filePath", ""),
+            line=item.get("line"),
+            description=f"unused export: {item.get('symbol', '')}",
+            tool="knip",
+        ))
+    # Unused dependencies
+    for dep in data.get("dependencies", {}).get("unused", []):
+        report.add(Finding(
+            category="unused_import",
+            severity="medium",
+            file="package.json",
+            line=None,
+            description=f"unused dependency: {dep}",
+            tool="knip",
+        ))
+
+
+def run_jscpd(root: str, report: Report) -> None:
+    """Duplicate code detection via jscpd."""
+    if not _tool_available("jscpd") and not _tool_available("npx"):
+        report.add_error("jscpd not available (npm i -g jscpd or use npx jscpd)")
+        return
+    cmd = ["jscpd", ".", "--reporters", "json", "--output", "/tmp/jscpd-report", "--silent"]
+    if not _tool_available("jscpd"):
+        cmd = ["npx", "--yes", "jscpd"] + cmd[1:]
+    _run(cmd, root, timeout=180)
+
+    report_file = Path("/tmp/jscpd-report/jscpd-report.json")
+    if not report_file.exists():
+        return
+    try:
+        data = json.loads(report_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    for clone in data.get("duplicates", []):
+        first = clone.get("firstFile", {})
+        second = clone.get("secondFile", {})
+        lines = clone.get("lines", 0)
+        severity = "high" if lines >= 20 else "medium" if lines >= 10 else "low"
+        report.add(Finding(
+            category="duplicate",
+            severity=severity,
+            file=first.get("name", ""),
+            line=first.get("start"),
+            description=(
+                f"{lines}-line duplicate block also at "
+                f"{second.get('name','')}:{second.get('start','')}"
+            ),
+            tool="jscpd",
+        ))
+
+
+def find_unused_files_heuristic(root: Path, report: Report) -> None:
+    """
+    Heuristic: find files with no inbound references using simple grep.
+    Works for any language. Lower confidence than AST-based tools.
+    """
+    all_files: list[Path] = []
+    for p in root.rglob("*"):
+        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
+            all_files.append(p)
+
+    # Build a set of all file stems referenced in source files
+    referenced: set[str] = set()
+    src_exts = set(EXT_MAP.keys())
+    for p in all_files:
+        if p.suffix.lower() not in src_exts:
+            continue
+        try:
+            content = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        # Extract import-like references: quoted strings with path separators
+        for m in re.finditer(r"""['"/]([^'">\s]+)['"/]""", content):
+            token = m.group(1)
+            stem = Path(token).stem
+            if stem:
+                referenced.add(stem)
+            referenced.add(token.lstrip("./"))
+
+    for p in all_files:
+        if p.suffix.lower() not in src_exts:
+            continue
+        rel = str(p.relative_to(root))
+        stem = p.stem
+        # Skip entry points and test files — commonly unreferenced by design
+        if stem in ("index", "main", "app", "server", "__init__", "manage", "cli"):
+            continue
+        if any(part in rel for part in ("test", "spec", "__test__", "fixtures")):
+            continue
+        if stem not in referenced and rel not in referenced:
+            report.add(Finding(
+                category="unused_file",
+                severity="low",
+                file=rel,
+                line=None,
+                description="no detected inbound reference (heuristic — verify before removing)",
+                tool="heuristic",
+            ))
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    root_arg = sys.argv[1] if len(sys.argv) > 1 else "."
+    mode = sys.argv[2] if len(sys.argv) > 2 else "--json"
+    root = Path(root_arg).resolve()
+
+    if not root.is_dir():
+        print(f"ERROR: {root} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    langs = detect_languages(root)
+    report = Report(project_root=str(root), languages=langs)
+
+    print(f"Detected languages: {', '.join(langs) or 'none'}", file=sys.stderr)
+    print(f"Running analysis on: {root}", file=sys.stderr)
+
+    if "python" in langs:
+        print("  → vulture (Python dead code)...", file=sys.stderr)
+        run_vulture(str(root), report)
+        print("  → pyflakes (Python unused imports)...", file=sys.stderr)
+        run_pyflakes(str(root), report)
+
+    if "javascript" in langs or "typescript" in langs:
+        print("  → knip (JS/TS dead exports + unused files)...", file=sys.stderr)
+        run_knip(str(root), report)
+
+    if langs:
+        print("  → jscpd (duplicate code)...", file=sys.stderr)
+        run_jscpd(str(root), report)
+        print("  → heuristic file reference scan...", file=sys.stderr)
+        find_unused_files_heuristic(root, report)
+
+    report.build_summary()
+
+    if mode == "--summary":
+        print(f"\n=== Code Purge Analysis: {root} ===")
+        print(f"Languages: {', '.join(langs) or 'none'}")
+        print(f"Total findings: {report.summary.get('total', 0)}")
+        for cat, count in report.summary.get("by_category", {}).items():
+            print(f"  {cat}: {count}")
+        if report.tool_errors:
+            print("\nTool warnings:")
+            for e in report.tool_errors:
+                print(f"  ⚠ {e}")
+        print("\nTop findings:")
+        high = [f for f in report.findings if f.severity == "high"][:10]
+        for f in high:
+            print(f"  [{f.category}] {f.file}:{f.line or '?'} — {f.description}")
+    else:
+        print(json.dumps(asdict(report), indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+interface:
+  display_name: "Code Purge"
+  short_description: "Remove dead code, duplicates & unused files"
+  brand_color: "#EF4444"
+  default_prompt: "Use $code-purge to analyze my project and clean up dead code, unused imports, and unreferenced files."
+
+policy:
+  allow_implicit_invocation: true
