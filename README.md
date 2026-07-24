@@ -1,5 +1,7 @@
 # Code Purge
 
+![Blotcat sweeping away dead, crumbling code blocks from a healthy, glowing project tree](assets/blotcat-hero.jpg)
+
 Code Purge is an agent skill for finding and safely removing code that no longer serves a project. It combines static analysis with manual review, creates a non-destructive backup, asks for approval before editing, and runs the project's tests after cleanup.
 
 ## What It Finds
@@ -14,6 +16,8 @@ Code Purge is an agent skill for finding and safely removing code that no longer
 Static analysis is treated as evidence, not proof. Framework callbacks, reflection, configuration-driven references, plugin registration, and public APIs are reviewed before anything is removed.
 
 ## How It Works
+
+![Blotcat confidently jumping across 5 sequential stepping stones representing the purge workflow](assets/blotcat-workflow.jpg)
 
 Code Purge follows five phases:
 
