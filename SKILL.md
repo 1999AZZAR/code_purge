@@ -23,7 +23,7 @@ A five-phase workflow for safe, thorough removal of waste from any codebase.
 ```
 Phase 1 → Analyze     deep scan: detect languages, map dead code, duplicates, unused files
 Phase 2 → Report      present findings to user, confirm scope before touching anything
-Phase 3 → Backup      snapshot the codebase (git stash + tar)
+Phase 3 → Backup      snapshot the codebase without changing working-tree or index state
 Phase 4 → Clean       execute removals in order: imports → dead code → files → refactors
 Phase 5 → Verify      run test suite; report pass/fail; rollback guide if needed
 ```
@@ -39,10 +39,12 @@ python3 scripts/analyze.py <project_root> --summary     # quick overview
 python3 scripts/analyze.py <project_root> --json        # full machine-readable report
 ```
 
-The script auto-detects languages and dispatches to:
+The script auto-detects languages and dispatches to installed tools:
 - **Python**: `vulture` (dead code) + `pyflakes` (unused imports)
 - **JS/TS**: `knip` (dead exports, unused deps, unused files)
-- **All languages**: `jscpd` (duplicate blocks) + heuristic file reference scan
+- **All languages**: `jscpd` (duplicate blocks)
+
+Use project-pinned tool executables when available. Do not let `npx` download and execute an unpinned package during analysis.
 
 Read `references/tools.md` for the full tool inventory and manual commands per language.
 
@@ -84,15 +86,14 @@ bash scripts/backup.sh <project_root>
 ```
 
 The script creates:
-1. A `git stash` with a timestamped message (if inside a git repo)
-2. A `.tar.gz` archive in `<project_root>/.code-purge-backups/`
+1. Git status and binary patches for tracked staged/unstaged changes (if inside a git repo)
+2. A `.tar.gz` archive under `${XDG_STATE_HOME:-$HOME/.local/state}/code-purge/`, including untracked files
 
-Note the stash ref and archive path — include them in the final summary so the user knows how to rollback.
+Set `CODE_PURGE_BACKUP_ROOT` to override the backup location. The script never writes inside, stages, stashes, resets, or otherwise mutates the target repository. Note the archive path in the final summary.
 
-**Rollback commands to provide to user:**
+**Rollback command to provide to user:**
 ```bash
-git stash pop <stash-ref>          # restore git-backed projects
-tar -xzf .code-purge-backups/backup_TIMESTAMP.tar.gz -C ..   # restore from tar
+tar -xzf <backup-directory>/project.tar.gz -C <project_root>
 ```
 
 ---
@@ -145,7 +146,7 @@ Key rules:
 bash scripts/run_tests.sh <project_root>
 ```
 
-The script auto-detects pytest, jest/vitest/mocha, go test, cargo test, rspec, and maven.
+The script auto-detects pytest, jest/vitest/mocha, go test, cargo test, rspec, and maven. Exit `0` means at least one detected suite passed, `1` means a suite failed, and `2` means no suite could be executed. Exit `2` is unverified, not success.
 
 **If tests pass**: commit the cleanup with a message like:
 ```
@@ -159,7 +160,7 @@ chore: remove dead code, unused imports, and 5 unreferenced files
 
 **If tests fail**:
 1. Identify which removal caused the failure (bisect with `git diff --stat`)
-2. Restore that specific file: `git checkout HEAD~1 -- path/to/file`
+2. Restore that specific file from the backup archive without overwriting unrelated files
 3. Re-run tests to confirm restoration
 4. Investigate: was the "dead" code actually called dynamically (reflection, config)?
 5. Add to a "skip list" for this project and continue with the rest
@@ -174,8 +175,8 @@ pip install vulture pyflakes autoflake radon lizard
 
 # JS/TS (pick one)
 npm i -g knip jscpd
-npx knip          # zero-install alternative
-npx jscpd .       # zero-install alternative
+npm exec --offline knip
+npm exec --offline jscpd -- .
 ```
 
 Read `references/tools.md` for per-language tool details, Go/Rust/Ruby specifics, and SonarQube setup.

@@ -1,37 +1,20 @@
 #!/usr/bin/env bash
 # Creates a backup of the project before code-purge modifications.
-# Usage: backup.sh [project_root] [--tar-only|--git-only]
+# Usage: backup.sh [project_root]
 # Output: prints backup location(s) to stdout
 
 set -euo pipefail
 
-PROJECT_ROOT="${1:-.}"
-MODE="${2:-auto}"
+PROJECT_ROOT=$(realpath "${1:-.}")
 TS=$(date +%Y%m%d_%H%M%S)
-BACKUP_DIR="${PROJECT_ROOT}/.code-purge-backups"
-
-cd "$PROJECT_ROOT"
-
+BACKUP_ROOT="${CODE_PURGE_BACKUP_ROOT:-${XDG_STATE_HOME:-${HOME}/.local/state}/code-purge}"
+PROJECT_ID=$(printf '%s' "$PROJECT_ROOT" | sha256sum | cut -c1-12)
+BACKUP_DIR="${BACKUP_ROOT}/$(basename "$PROJECT_ROOT")_${PROJECT_ID}_${TS}"
 mkdir -p "$BACKUP_DIR"
-
-# ── Git stash backup ───────────────────────────────────────────────────────────
-do_git_backup() {
-  if git rev-parse --is-inside-work-tree &>/dev/null; then
-    STASH_MSG="code-purge-backup-${TS}"
-    # Stage everything so untracked files are included in the stash
-    git add -A
-    if git stash push --include-untracked -m "$STASH_MSG" 2>/dev/null; then
-      STASH_REF=$(git stash list | grep "$STASH_MSG" | head -1 | cut -d: -f1)
-      echo "git:${STASH_REF} (${STASH_MSG})"
-      return 0
-    fi
-  fi
-  return 1
-}
 
 # ── Tar backup ────────────────────────────────────────────────────────────────
 do_tar_backup() {
-  ARCHIVE="${BACKUP_DIR}/backup_${TS}.tar.gz"
+  ARCHIVE="${BACKUP_DIR}/project.tar.gz"
   # Exclude common noise directories
   tar -czf "$ARCHIVE" \
     --exclude="./.git" \
@@ -39,30 +22,21 @@ do_tar_backup() {
     --exclude="./__pycache__" \
     --exclude="./.venv" \
     --exclude="./venv" \
-    --exclude="./.code-purge-backups" \
     --exclude="./dist" \
     --exclude="./build" \
-    -C "$(dirname "$PROJECT_ROOT")" \
-    "$(basename "$PROJECT_ROOT")" 2>/dev/null || \
-  tar -czf "$ARCHIVE" \
-    --exclude=".git" \
-    --exclude="node_modules" \
-    --exclude="__pycache__" \
-    --exclude=".venv" \
-    --exclude="venv" \
-    --exclude=".code-purge-backups" \
-    --exclude="dist" \
-    --exclude="build" \
-    . 2>/dev/null
+    -C "$PROJECT_ROOT" \
+    .
   echo "tar:${ARCHIVE}"
 }
 
-case "$MODE" in
-  --git-only)  do_git_backup || { echo "ERROR: Not a git repo"; exit 1; } ;;
-  --tar-only)  do_tar_backup ;;
-  auto)
-    # Prefer git stash; always also create tar as hard backup
-    do_git_backup || true
-    do_tar_backup
-    ;;
-esac
+do_git_metadata_backup() {
+  if git -C "$PROJECT_ROOT" rev-parse --is-inside-work-tree &>/dev/null; then
+    git -C "$PROJECT_ROOT" status --short >"${BACKUP_DIR}/status.txt"
+    git -C "$PROJECT_ROOT" diff --binary >"${BACKUP_DIR}/working.patch"
+    git -C "$PROJECT_ROOT" diff --cached --binary >"${BACKUP_DIR}/staged.patch"
+    echo "git-metadata:${BACKUP_DIR}"
+  fi
+}
+
+do_git_metadata_backup
+do_tar_backup

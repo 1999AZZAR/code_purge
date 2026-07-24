@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
@@ -108,7 +110,12 @@ def _run(cmd: list[str], cwd: str, timeout: int = 120) -> tuple[int, str, str]:
 
 
 def _tool_available(name: str) -> bool:
-    return subprocess.run(["which", name], capture_output=True).returncode == 0
+    return shutil.which(name) is not None
+
+
+def _project_node_tool(root: str, name: str) -> str | None:
+    tool = Path(root) / "node_modules" / ".bin" / name
+    return str(tool) if tool.is_file() and tool.stat().st_mode & 0o111 else None
 
 
 def run_vulture(root: str, report: Report) -> None:
@@ -170,16 +177,20 @@ def run_pyflakes(root: str, report: Report) -> None:
 
 def run_knip(root: str, report: Report) -> None:
     """JS/TS dead exports and unused files via knip."""
-    if not _tool_available("knip") and not _tool_available("npx"):
-        report.add_error("knip not available (npm i -g knip or use npx knip)")
+    tool = _project_node_tool(root, "knip")
+    if tool is None:
+        report.add_error("knip not installed; use the project's pinned knip executable")
         return
-    cmd = ["knip", "--reporter", "json"] if _tool_available("knip") else ["npx", "--yes", "knip", "--reporter", "json"]
-    out = _run(cmd, root, timeout=180)[1]
+    code, out, err = _run([tool, "--reporter", "json"], root, timeout=180)
+    if code not in (0, 1):
+        report.add_error(f"knip failed: {err.strip() or f'exit {code}'}")
+        return
     if not out.strip():
         return
     try:
         data = json.loads(out)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        report.add_error(f"knip returned invalid JSON: {exc}")
         return
 
     # Unused files
@@ -216,21 +227,26 @@ def run_knip(root: str, report: Report) -> None:
 
 def run_jscpd(root: str, report: Report) -> None:
     """Duplicate code detection via jscpd."""
-    if not _tool_available("jscpd") and not _tool_available("npx"):
-        report.add_error("jscpd not available (npm i -g jscpd or use npx jscpd)")
+    tool = _project_node_tool(root, "jscpd")
+    if tool is None:
+        report.add_error("jscpd not installed; use the project's pinned jscpd executable")
         return
-    cmd = ["jscpd", ".", "--reporters", "json", "--output", "/tmp/jscpd-report", "--silent"]
-    if not _tool_available("jscpd"):
-        cmd = ["npx", "--yes", "jscpd"] + cmd[1:]
-    _run(cmd, root, timeout=180)
+    with tempfile.TemporaryDirectory(prefix="code-purge-jscpd-") as output_dir:
+        cmd = [tool, ".", "--reporters", "json", "--output", output_dir, "--silent"]
+        code, _, err = _run(cmd, root, timeout=180)
+        if code not in (0, 1):
+            report.add_error(f"jscpd failed: {err.strip() or f'exit {code}'}")
+            return
 
-    report_file = Path("/tmp/jscpd-report/jscpd-report.json")
-    if not report_file.exists():
-        return
-    try:
-        data = json.loads(report_file.read_text())
-    except (json.JSONDecodeError, OSError):
-        return
+        report_file = Path(output_dir) / "jscpd-report.json"
+        if not report_file.exists():
+            report.add_error("jscpd did not produce a JSON report")
+            return
+        try:
+            data = json.loads(report_file.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            report.add_error(f"unable to read jscpd report: {exc}")
+            return
 
     for clone in data.get("duplicates", []):
         first = clone.get("firstFile", {})
@@ -248,55 +264,6 @@ def run_jscpd(root: str, report: Report) -> None:
             ),
             tool="jscpd",
         ))
-
-
-def find_unused_files_heuristic(root: Path, report: Report) -> None:
-    """
-    Heuristic: find files with no inbound references using simple grep.
-    Works for any language. Lower confidence than AST-based tools.
-    """
-    all_files: list[Path] = []
-    for p in root.rglob("*"):
-        if p.is_file() and not any(part in SKIP_DIRS for part in p.parts):
-            all_files.append(p)
-
-    # Build a set of all file stems referenced in source files
-    referenced: set[str] = set()
-    src_exts = set(EXT_MAP.keys())
-    for p in all_files:
-        if p.suffix.lower() not in src_exts:
-            continue
-        try:
-            content = p.read_text(errors="ignore")
-        except OSError:
-            continue
-        # Extract import-like references: quoted strings with path separators
-        for m in re.finditer(r"""['"/]([^'">\s]+)['"/]""", content):
-            token = m.group(1)
-            stem = Path(token).stem
-            if stem:
-                referenced.add(stem)
-            referenced.add(token.lstrip("./"))
-
-    for p in all_files:
-        if p.suffix.lower() not in src_exts:
-            continue
-        rel = str(p.relative_to(root))
-        stem = p.stem
-        # Skip entry points and test files — commonly unreferenced by design
-        if stem in ("index", "main", "app", "server", "__init__", "manage", "cli"):
-            continue
-        if any(part in rel for part in ("test", "spec", "__test__", "fixtures")):
-            continue
-        if stem not in referenced and rel not in referenced:
-            report.add(Finding(
-                category="unused_file",
-                severity="low",
-                file=rel,
-                line=None,
-                description="no detected inbound reference (heuristic — verify before removing)",
-                tool="heuristic",
-            ))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -329,8 +296,6 @@ def main() -> None:
     if langs:
         print("  → jscpd (duplicate code)...", file=sys.stderr)
         run_jscpd(str(root), report)
-        print("  → heuristic file reference scan...", file=sys.stderr)
-        find_unused_files_heuristic(root, report)
 
     report.build_summary()
 

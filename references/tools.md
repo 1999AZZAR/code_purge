@@ -16,7 +16,7 @@
 
 | Tool | Purpose | Install | Command |
 |------|---------|---------|---------|
-| `knip` | Dead exports, unused files, unused deps | `npm i -g knip` | `knip --reporter json` |
+| `knip` | Dead exports, unused files, unused deps | project dev dependency | `knip --reporter json` |
 | `ts-prune` | Unused TS exports only | `npm i -g ts-prune` | `ts-prune` |
 | `depcheck` | Unused npm dependencies | `npm i -g depcheck` | `depcheck` |
 | `eslint` | Unused vars/imports (with plugins) | project-specific | `eslint --rule 'no-unused-vars: error'` |
@@ -28,7 +28,7 @@
 
 | Tool | Purpose | Install | Command |
 |------|---------|---------|---------|
-| `jscpd` | Copy-paste detection, multi-language | `npm i -g jscpd` | `jscpd . --min-lines 5 --min-tokens 50` |
+| `jscpd` | Copy-paste detection, multi-language | project dev dependency | `jscpd . --min-lines 5 --min-tokens 50` |
 | `PMD CPD` | Java/C++/JS duplicate detection | JVM required | `cpd --minimum-tokens 50 --files src/` |
 | `SonarQube` | Enterprise-grade (incl. cognitive complexity) | Docker | `sonar-scanner` |
 
@@ -79,17 +79,7 @@ lizard . --CCN 10 --length 50    # flag functions with CC>10 or >50 lines
 
 ## File-level unused detection
 
-For projects without a bundler/import graph, use `analyze.py`'s heuristic scanner.
-For large monorepos, consider:
-```bash
-# Find files never imported/required (grep-based, Node projects)
-find src -name "*.js" -o -name "*.ts" | while read f; do
-  stem=$(basename "$f" | sed 's/\.[^.]*$//')
-  if ! grep -rq "$stem" src/ --include="*.{js,ts}" --exclude="$f"; then
-    echo "POSSIBLY UNUSED: $f"
-  fi
-done
-```
+Use a language-aware import graph such as `knip`. Do not infer that a file is unused from filename grep alone; imports, framework registration, runtime configuration, and external consumers make that signal unreliable.
 
 ## Auto-fix tools (use with caution — always backup first)
 
