@@ -108,6 +108,8 @@ CODE_PURGE_BACKUP_ROOT=/safe/backups bash scripts/backup.sh /path/to/project
 
 ## Safety Guarantees
 
+![Blotcat taking a photo snapshot of a codebase into an external safe state box before taking out pruning shears](assets/blotcat-safety.jpg)
+
 - No cleanup starts before the user approves its scope.
 - A backup is created before files are changed.
 - The backup process preserves the working tree and staging area.
